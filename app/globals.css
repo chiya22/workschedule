@@ -21,6 +21,7 @@
   --color-shift-part-time-border: #22c55e;
 }
 
+html,
 body {
   background: var(--color-bg-primary);
   color: var(--color-text-primary);
