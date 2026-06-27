@@ -1,0 +1,354 @@
+---
+description: Supabase Auth を使った認証フローの規約。ログイン・サインアップ・セッション管理・スタッフ招待フローのパターンを定義する。1店舗運用前提。
+globs:
+  - "app/(auth)/**/*"
+  - "app/auth/**/*"
+  - "lib/auth/**/*"
+  - "middleware.ts"
+alwaysApply: false
+---
+
+# 認証フローの実装規約
+
+このプロジェクトは Supabase Auth を使った認証を実装します。
+**1店舗運用が前提**のため、シングルテナント構成として簡略化します。
+
+---
+
+## 認証の全体像
+
+```
+[サインアップ画面]
+    ↓ メール+パスワード or Google OAuth
+[Supabase Auth: auth.users にユーザー作成]
+    ↓
+[オンボーディング画面]
+    ↓ スタッフ名入力
+[staff テーブルにレコード作成]
+    ↓
+[カレンダー画面（認証完了）]
+```
+
+### 1店舗運用の方針
+
+- 店舗マスタは存在しないため、staff レコードの存在で「認証済み利用者」を判定
+- 最初に登録したユーザーが `role: 'owner'` になる
+- 2人目以降は招待制（招待コード）で `role: 'manager'` または `role: 'staff'` として登録
+
+---
+
+## ディレクトリ構成
+
+```
+app/
+├── (auth)/                      # 認証関連（未ログインでアクセス可）
+│   ├── login/page.tsx          # ログイン画面
+│   ├── signup/page.tsx         # サインアップ画面
+│   ├── forgot-password/page.tsx
+│   ├── reset-password/page.tsx
+│   └── layout.tsx              # 認証ページ用レイアウト
+│
+├── auth/
+│   ├── callback/route.ts       # OAuth コールバック
+│   └── confirm/route.ts        # メール確認リンク用
+│
+├── (dashboard)/
+│   ├── onboarding/page.tsx     # スタッフ情報初回登録
+│   ├── settings/staff/page.tsx # スタッフ管理（オーナーのみ）
+│   └── ...
+│
+└── ...
+
+lib/
+└── auth/
+    ├── actions.ts              # ログイン・サインアップの Server Action
+    ├── helpers.ts              # 認証チェックヘルパー
+    └── invite.ts               # 招待コード関連
+```
+
+---
+
+## ページ単位のアクセス制御
+
+| パス | 認証要求 | リダイレクト先 |
+|---|---|---|
+| `/login` | 不要（ログイン済みなら `/calendar` へ） | - |
+| `/signup` | 不要（ログイン済みなら `/calendar` へ） | - |
+| `/onboarding` | 認証必須・staff レコード未作成のみ | あれば `/calendar` |
+| `/calendar` 配下 | 認証必須 + staff レコード必須 | `/login` または `/onboarding` |
+| `/settings/staff` | 認証必須 + role が `owner` | `/calendar` |
+
+このルーティング判定は `middleware.ts` で行います。
+
+---
+
+## getUser vs getSession
+
+```ts
+// ✅ Good: 必ず getUser() を使用する
+const { data: { user } } = await supabase.auth.getUser()
+
+// ❌ Bad: getSession() は Cookie の値をそのまま返すため
+//        改ざんされている可能性がある
+const { data: { session } } = await supabase.auth.getSession()
+```
+
+`getUser()` は Supabase サーバーに問い合わせてトークンを検証するため、
+セキュリティ上必ず `getUser()` を使ってください。
+
+---
+
+## 認証 Server Action の実装パターン
+
+`lib/auth/actions.ts` に Server Action として実装します。
+
+### ログイン
+
+```ts
+'use server'
+
+import { z } from 'zod'
+import { redirect } from 'next/navigation'
+import { revalidatePath } from 'next/cache'
+import { createClient } from '@/lib/supabase/server'
+import type { Result } from '@/types/result'
+
+const loginSchema = z.object({
+  email: z.string().email('正しいメールアドレスを入力してください'),
+  password: z.string().min(8, 'パスワードは8文字以上で入力してください'),
+})
+
+export async function login(formData: FormData): Promise<Result<void, string>> {
+  const parsed = loginSchema.safeParse({
+    email: formData.get('email'),
+    password: formData.get('password'),
+  })
+
+  if (!parsed.success) {
+    const firstError = Object.values(parsed.error.flatten().fieldErrors)[0]?.[0]
+    return { success: false, error: firstError ?? '入力内容に問題があります' }
+  }
+
+  const supabase = createClient()
+  const { error } = await supabase.auth.signInWithPassword(parsed.data)
+
+  if (error) {
+    return { success: false, error: 'メールアドレスまたはパスワードが正しくありません' }
+  }
+
+  revalidatePath('/', 'layout')
+  redirect('/calendar')
+}
+```
+
+### サインアップ
+
+```ts
+const signupSchema = z.object({
+  email: z.string().email('正しいメールアドレスを入力してください'),
+  password: z.string().min(8, 'パスワードは8文字以上で入力してください'),
+  invite_code: z.string().optional(),
+})
+
+export async function signup(formData: FormData): Promise<Result<void, string>> {
+  const parsed = signupSchema.safeParse({
+    email: formData.get('email'),
+    password: formData.get('password'),
+    invite_code: formData.get('invite_code'),
+  })
+
+  if (!parsed.success) {
+    return { success: false, error: '入力内容に問題があります' }
+  }
+
+  const supabase = createClient()
+  const { error } = await supabase.auth.signUp({
+    email: parsed.data.email,
+    password: parsed.data.password,
+    options: {
+      emailRedirectTo: `${process.env.NEXT_PUBLIC_SITE_URL}/auth/confirm`,
+      data: {
+        invite_code: parsed.data.invite_code,
+      },
+    },
+  })
+
+  if (error) {
+    return { success: false, error: error.message }
+  }
+
+  return { success: true, data: undefined }
+}
+```
+
+### ログアウト
+
+```ts
+export async function logout(): Promise<void> {
+  const supabase = createClient()
+  await supabase.auth.signOut()
+  revalidatePath('/', 'layout')
+  redirect('/login')
+}
+```
+
+---
+
+## OAuth コールバックの実装
+
+`app/auth/callback/route.ts` を作成します。
+
+```ts
+import { NextResponse, type NextRequest } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+
+export async function GET(request: NextRequest) {
+  const { searchParams, origin } = new URL(request.url)
+  const code = searchParams.get('code')
+  const next = searchParams.get('next') ?? '/calendar'
+
+  if (code) {
+    const supabase = createClient()
+    const { error } = await supabase.auth.exchangeCodeForSession(code)
+    if (!error) {
+      return NextResponse.redirect(`${origin}${next}`)
+    }
+  }
+
+  return NextResponse.redirect(`${origin}/login?error=auth_failed`)
+}
+```
+
+---
+
+## オンボーディングフロー
+
+新規ユーザーがサインアップ後、`/onboarding` で staff レコードを作成します。
+
+### 1人目（オーナー）の判定
+
+```ts
+'use server'
+
+export async function completeOnboarding(
+  formData: FormData
+): Promise<Result<void, string>> {
+  const supabase = createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
+  if (!user) {
+    return { success: false, error: '認証が必要です' }
+  }
+
+  // 既存のスタッフ数をチェック
+  const { count } = await supabase
+    .from('staff')
+    .select('id', { count: 'exact', head: true })
+
+  // 1人目はオーナー、2人目以降は招待コードに従う
+  let role: 'owner' | 'manager' | 'staff' = 'owner'
+
+  if (count && count > 0) {
+    // 招待コードの検証
+    const inviteCode = formData.get('invite_code') as string | null
+    if (!inviteCode) {
+      return {
+        success: false,
+        error: '既にスタッフが登録されています。招待コードを入力してください',
+      }
+    }
+
+    const inviteResult = await consumeInviteCode(inviteCode, user.id)
+    if (!inviteResult.success) {
+      return inviteResult
+    }
+    role = inviteResult.data.role
+  }
+
+  // staff レコード作成
+  const name = formData.get('name') as string
+  const { error } = await supabase.from('staff').insert({
+    user_id: user.id,
+    name,
+    role,
+  })
+
+  if (error) {
+    return { success: false, error: 'スタッフ登録に失敗しました' }
+  }
+
+  redirect('/calendar')
+}
+```
+
+---
+
+## 招待コード方式
+
+招待用の専用テーブル `invitations` を作成します。
+
+```sql
+CREATE TYPE invitation_status AS ENUM ('pending', 'accepted', 'expired');
+
+CREATE TABLE invitations (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code          TEXT UNIQUE NOT NULL,             -- ランダム文字列
+  email         TEXT,                             -- 招待先メール（任意）
+  role          staff_role NOT NULL DEFAULT 'staff',
+  invited_by    UUID NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  status        invitation_status NOT NULL DEFAULT 'pending',
+  expires_at    TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
+  accepted_at   TIMESTAMPTZ,
+  accepted_by   UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_invitations_code ON invitations(code) WHERE status = 'pending';
+ALTER TABLE invitations ENABLE ROW LEVEL SECURITY;
+```
+
+招待コードの生成・消費ロジックは `lib/auth/invite.ts` に実装します。
+
+---
+
+## エラーハンドリング・メッセージ
+
+ユーザーに見せるエラーは以下の方針で統一してください。
+
+| 状況 | メッセージ |
+|---|---|
+| 認証情報誤り | メールアドレスまたはパスワードが正しくありません |
+| メール未確認 | メールに送られた確認リンクをクリックしてください |
+| 既登録メール | このメールアドレスは既に登録されています |
+| 招待コード誤り | 招待コードが正しくないか、有効期限が切れています |
+| ネットワークエラー | 接続に問題が発生しました。しばらくしてから再度お試しください |
+
+技術的な詳細はユーザーに見せず、必ず人間にわかる文言に変換してください。
+
+---
+
+## セキュリティの注意
+
+```
+✅ パスワードは最低8文字を要求
+✅ Server Action 内では必ず getUser() でトークン検証
+✅ Cookie には Supabase が設定する Secure / HttpOnly フラグを利用
+✅ メール確認を必須化（Supabase ダッシュボードで設定）
+✅ レート制限を Supabase 側で設定
+
+❌ クライアント側にメール確認状態を保存しない
+❌ パスワードを localStorage / sessionStorage に保存しない
+❌ Service Role Key をクライアント側で使用しない
+```
+
+---
+
+## 禁止事項
+
+```
+❌ getSession() を認証チェックに使用（必ず getUser() を使う）
+❌ クライアント側でロール判定（middleware や Server Component で判定）
+❌ パスワードを Server Action 経由以外で扱う
+❌ 招待コードをクライアント側で生成
+❌ メール確認をスキップする実装
+```

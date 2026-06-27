@@ -1,0 +1,422 @@
+---
+description: データアクセス層（lib/data/）の規約。Server Component とクライアントの責務分離、Server Action の書き方、データ取得関数の命名規則を定義する。
+globs:
+  - "lib/data/**/*.ts"
+  - "app/**/page.tsx"
+  - "app/**/layout.tsx"
+  - "app/api/**/*.ts"
+alwaysApply: true
+---
+
+# データアクセス層の規約
+
+このプロジェクトでは、データ取得・更新ロジックを `lib/data/` に集約します。
+コンポーネントから直接 Supabase を呼ばず、必ずこの層を経由してください。
+
+---
+
+## なぜデータアクセス層を分離するのか
+
+```
+✅ ビジネスロジックを一箇所にまとめられる
+✅ コンポーネントが Supabase の実装詳細を知らなくてよい
+✅ テストしやすい（モックしやすい）
+✅ 将来的にバックエンドを変更しても影響範囲が狭い
+✅ クエリの最適化（N+1解消など）を一括で行える
+```
+
+---
+
+## ディレクトリ構成
+
+```
+lib/data/
+├── auth.ts                 # 認証ユーザー ↔ staff の解決
+├── reservations.ts       # 予約の取得（読み取り専用クエリ）
+├── reservation-shared.ts # Zod・業務ルール（Server 側で import）
+├── reservation-actions.ts # create / update / cancel（'use server' ファイル）
+├── tables.ts               # 座席マスタ一覧
+├── customers.ts            # （将来）顧客関連
+└── staff.ts                # （将来）スタッフ CRUD
+```
+
+**単一店舗前提**: `stores.ts` は存在しない。店舗 ID でのスコープ分けは行わない。
+
+各ファイルは以下の構造で実装してください。
+
+```ts
+// lib/data/reservations.ts … 取得のみ（'use server' 不要）
+
+// lib/data/reservation-shared.ts … Zod・checkBusinessRules（サーバーからのみ import）
+
+// lib/data/reservation-actions.ts … ファイル先頭に 'use server'
+// createReservation / updateReservation / cancelReservation
+```
+
+---
+
+## 関数の命名規則
+
+### 取得系（読み取り）
+
+| プレフィックス | 用途 | 例 |
+|---|---|---|
+| `get` | 単一・複数の取得 | `getReservationById`, `getReservationsByDateRange` |
+| `list` | 一覧の取得（フィルタ・ソート前提） | `listReservations` |
+| `count` | 件数の取得 | `countReservationsByCategory` |
+| `find` | 検索（見つからない可能性あり） | `findCustomerByPhone` |
+
+### 更新系（書き込み）
+
+| プレフィックス | 用途 | 例 |
+|---|---|---|
+| `create` | 新規作成 | `createReservation` |
+| `update` | 既存更新 | `updateReservation` |
+| `delete` | 削除（物理） | `deleteCustomer` |
+| `cancel` | 論理削除（status 変更） | `cancelReservation` |
+| `mark` | ステータス変更 | `markAsCompleted`, `markAsNoShow` |
+
+---
+
+## 取得系関数の実装パターン
+
+### 単純な取得
+
+```ts
+export async function getReservationById(
+  id: string
+): Promise<ReservationWithTable | null> {
+  const supabase = createClient()
+
+  const { data, error } = await supabase
+    .from('reservations')
+    .select(`
+      *,
+      table:tables (id, name, capacity)
+    `)
+    .eq('id', id)
+    .maybeSingle()
+
+  if (error) {
+    console.error('Failed to get reservation:', error)
+    return null
+  }
+
+  return data
+}
+```
+
+### 範囲指定の取得（カレンダー用）
+
+```ts
+export async function getReservationsByDateRange(
+  startAt: Date,
+  endAt: Date
+): Promise<ReservationWithTable[]> {
+  const supabase = createClient()
+
+  const { data, error } = await supabase
+    .from('reservations')
+    .select(`
+      id,
+      customer_name,
+      party_size,
+      category,
+      status,
+      start_at,
+      end_at,
+      notes,
+      table:tables (id, name, capacity)
+    `)
+    .neq('status', 'cancelled')
+    .lt('start_at', endAt.toISOString())
+    .gt('end_at', startAt.toISOString())
+    .order('start_at', { ascending: true })
+
+  if (error) {
+    console.error('Failed to fetch reservations:', error)
+    return []
+  }
+
+  return data ?? []
+}
+```
+
+### 取得系の注意点
+
+```
+✅ 失敗時は空配列 / null を返す（エラーを throw しない）
+✅ console.error でエラーログを残す
+✅ select() で必要なカラムのみ指定（select('*') は最小限に）
+✅ 結合は埋め込み select で1回のクエリにまとめる
+✅ Server Component から呼ばれる前提で createClient() を使用
+```
+
+---
+
+## 更新系関数の実装パターン
+
+### Server Action として実装
+
+```ts
+'use server'
+
+export async function createReservation(
+  input: ReservationInput
+): Promise<Result<Reservation, string>> {
+  // 1. バリデーション
+  const parsed = reservationInputSchema.safeParse(input)
+  if (!parsed.success) {
+    const firstError = Object.values(parsed.error.flatten().fieldErrors)[0]?.[0]
+    return { success: false, error: firstError ?? '入力内容に問題があります' }
+  }
+
+  // 2. ビジネスロジックチェック
+  const overlapCheck = await checkBusinessRules(parsed.data)
+  if (!overlapCheck.success) {
+    return overlapCheck
+  }
+
+  // 3. DB 更新
+  const supabase = createClient()
+  const { data, error } = await supabase
+    .from('reservations')
+    .insert(parsed.data)
+    .select()
+    .single()
+
+  if (error) {
+    // 重複制約違反
+    if (error.code === '23P01') {
+      return { success: false, error: 'この時間帯はすでに予約が入っています' }
+    }
+    return { success: false, error: '予約の作成に失敗しました' }
+  }
+
+  // 4. キャッシュの再検証
+  revalidatePath('/calendar')
+
+  return { success: true, data }
+}
+```
+
+### 更新系の必須要素
+
+```
+1. Zod バリデーション
+2. ビジネスルールのチェック（貸し切り時の他予約ブロックなど）
+3. DB 更新
+4. エラーコードのハンドリング（特に 23P01）
+5. revalidatePath() でキャッシュ再検証
+6. Result 型で結果を返す
+```
+
+### キャンセル（論理削除）
+
+```ts
+export async function cancelReservation(
+  id: string
+): Promise<Result<void, string>> {
+  const supabase = createClient()
+
+  const { error } = await supabase
+    .from('reservations')
+    .update({ status: 'cancelled' })
+    .eq('id', id)
+
+  if (error) {
+    return { success: false, error: 'キャンセルに失敗しました' }
+  }
+
+  revalidatePath('/calendar')
+  return { success: true, data: undefined }
+}
+```
+
+---
+
+## ビジネスルールチェックの分離
+
+複雑な業務ルールは別関数に分離してテストしやすくします。
+
+```ts
+// lib/data/reservation-shared.ts
+
+async function checkBusinessRules(
+  input: ReservationInput
+): Promise<Result<void, string>> {
+  const supabase = createClient()
+
+  // 営業時間チェック（DB の stores はない。UI / lib/calendar の定数で扱う）
+  // if (isOutsideBusinessHours(...)) { console.warn(...) }
+
+  // 貸し切り時の他予約ブロックチェック（店舗スコープなし・全予約が対象）
+  if (input.category === 'private') {
+    const { data: conflicts } = await supabase
+      .from('reservations')
+      .select('id')
+      .neq('status', 'cancelled')
+      .lt('start_at', input.end_at)
+      .gt('end_at', input.start_at)
+
+    if (conflicts && conflicts.length > 0) {
+      return {
+        success: false,
+        error: 'この時間帯は他の予約があるため貸し切りできません',
+      }
+    }
+  }
+
+  // 既存の貸し切り予約と被らないかチェック
+  const { data: privateBookings } = await supabase
+    .from('reservations')
+    .select('id')
+    .eq('category', 'private')
+    .neq('status', 'cancelled')
+    .lt('start_at', input.end_at)
+    .gt('end_at', input.start_at)
+
+  if (privateBookings && privateBookings.length > 0) {
+    return {
+      success: false,
+      error: 'この時間帯は貸し切り予約のため受け付けられません',
+    }
+  }
+
+  return { success: true, data: undefined }
+}
+```
+
+---
+
+## Result 型
+
+`types/result.ts` に定義してください。
+
+```ts
+// types/result.ts
+export type Result<T, E = Error> =
+  | { success: true; data: T }
+  | { success: false; error: E }
+
+// ヘルパー関数（オプション）
+export function ok<T>(data: T): Result<T, never> {
+  return { success: true, data }
+}
+
+export function err<E>(error: E): Result<never, E> {
+  return { success: false, error }
+}
+```
+
+---
+
+## 認証ユーザーとスタッフ行
+
+**単一現場**: 店舗 ID はない。ログインユーザーが `staff` に存在するかでダッシュボード可否を判定する。
+
+```ts
+// lib/data/auth.ts
+import { createClient } from '@/lib/supabase/server'
+import type { Staff } from '@/types'
+
+export async function getCurrentStaff(): Promise<Staff | null> {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return null
+
+  const { data } = await supabase
+    .from('staff')
+    .select('id, user_id, name, role, created_at')
+    .eq('user_id', user.id)
+    .maybeSingle()
+
+  return data
+}
+```
+
+ページコンポーネントでの使用:
+
+```tsx
+export default async function CalendarPage() {
+  const staff = await getCurrentStaff()
+  if (!staff) redirect('/login')
+
+  const reservations = await getReservationsByDateRange(rangeStart, rangeEnd)
+  return <CalendarView initialReservations={reservations} />
+}
+```
+
+---
+
+## コンポーネント側からの呼び出し
+
+### Server Component（取得）
+
+```tsx
+// app/(dashboard)/calendar/page.tsx
+import { getReservationsByDateRange } from '@/lib/data/reservations'
+
+export default async function Page() {
+  const reservations = await getReservationsByDateRange(...)
+  return <CalendarView initialReservations={reservations} />
+}
+```
+
+### Client Component（更新）
+
+```tsx
+'use client'
+
+import { createReservation } from '@/lib/data/reservation-actions'
+
+export function NewReservationModal({ onClose }) {
+  async function handleSubmit(data: FormData) {
+    const result = await createReservation({ ... })
+    if (!result.success) {
+      toast.error(result.error)
+      return
+    }
+    onClose()
+  }
+
+  return <form action={handleSubmit}>...</form>
+}
+```
+
+---
+
+## 禁止事項
+
+```
+❌ コンポーネントから直接 supabase.from() を呼ぶ
+❌ try-catch で Supabase エラーをキャッチ（error チェックを使う）
+❌ データ取得関数で throw する（Result 型 / null / [] で返す）
+❌ Zod バリデーションをスキップした更新処理
+❌ revalidatePath() を呼ばない更新処理
+❌ Server Action で 'use server' を書き忘れる
+❌ ファイル内で Server / Client クライアントを混在させる
+```
+
+---
+
+## ファイル単位のテスト
+
+データアクセス層は最もテストすべき層です。`testing-patterns.mdc` に従って
+`lib/data/reservation-actions.test.ts`（または `reservation-shared.test.ts`）を必ず作成してください。
+
+```ts
+import { describe, it, expect, vi } from 'vitest'
+import { createReservation } from './reservation-actions'
+
+vi.mock('@/lib/supabase/server', () => ({
+  createClient: vi.fn(() => mockSupabaseClient),
+}))
+
+describe('createReservation', () => {
+  it('正常系: 予約を作成して成功を返す', async () => { ... })
+  it('異常系: バリデーションエラー', async () => { ... })
+  it('異常系: 重複時間でのエラー', async () => { ... })
+  it('異常系: 貸し切り時間と被るエラー', async () => { ... })
+})
+```

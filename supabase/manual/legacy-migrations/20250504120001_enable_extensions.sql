@@ -1,0 +1,2 @@
+-- EXCLUDE 制約のために必要
+CREATE EXTENSION IF NOT EXISTS btree_gist;

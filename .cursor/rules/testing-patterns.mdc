@@ -1,0 +1,428 @@
+---
+description: テストコードの規約。Vitest（ユニットテスト）と Playwright（E2E テスト）の使い分け、書き方、命名規則を定義する。
+globs:
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/*.spec.ts"
+  - "tests/**/*"
+  - "e2e/**/*"
+alwaysApply: true
+---
+
+# テスト規約
+
+このプロジェクトのテスト方針と書き方の規約を定義します。
+
+---
+
+## テストの種類と使い分け
+
+| 種類 | ツール | 対象 | 配置 |
+|---|---|---|---|
+| ユニットテスト | Vitest | ユーティリティ関数・hooks・ドメインロジック | `*.test.ts` (同階層) |
+| コンポーネントテスト | Vitest + Testing Library | React コンポーネント | `*.test.tsx` (同階層) |
+| E2E テスト | Playwright | ユーザーフロー全体 | `e2e/*.spec.ts` |
+
+API（Route Handlers / Server Actions）のテストはユニットテストとして扱います。
+
+---
+
+## 必要なパッケージ
+
+```bash
+# ユニット・コンポーネントテスト
+npm install -D vitest @vitejs/plugin-react @testing-library/react @testing-library/jest-dom jsdom
+
+# E2E テスト
+npm install -D @playwright/test
+```
+
+---
+
+## ファイル配置
+
+### 同階層配置（ユニット・コンポーネントテスト）
+
+```
+lib/
+├── utils.ts
+├── utils.test.ts          # 同階層に配置
+├── reservation-helpers.ts
+└── reservation-helpers.test.ts
+
+components/
+├── calendar/
+│   ├── WeekView.tsx
+│   └── WeekView.test.tsx
+```
+
+### E2E は専用ディレクトリ
+
+```
+e2e/
+├── auth.spec.ts
+├── reservation-create.spec.ts
+└── reservation-update.spec.ts
+```
+
+---
+
+## ユニットテスト（Vitest）
+
+### 基本構造
+
+```ts
+// lib/format-date.test.ts
+import { describe, it, expect } from 'vitest'
+import { formatReservationTime } from './format-date'
+
+describe('formatReservationTime', () => {
+  it('開始時刻と終了時刻を「HH:MM 〜 HH:MM」形式で返す', () => {
+    const start = new Date('2026-05-03T18:00:00+09:00')
+    const end = new Date('2026-05-03T19:30:00+09:00')
+
+    expect(formatReservationTime(start, end)).toBe('18:00 〜 19:30')
+  })
+
+  it('日付が異なる場合は日付も含めて返す', () => {
+    const start = new Date('2026-05-03T22:30:00+09:00')
+    const end = new Date('2026-05-04T01:00:00+09:00')
+
+    expect(formatReservationTime(start, end)).toBe('5/3 22:30 〜 5/4 01:00')
+  })
+})
+```
+
+### テスト名の書き方（日本語推奨）
+
+テストの内容（仕様）を読みやすくするため、テスト名は日本語で書いてください。
+
+```ts
+// ✅ Good: 仕様が読み取れる
+it('貸し切り予約の場合、他テーブルへの予約をブロックする', () => {})
+it('cancelled ステータスの予約は重複チェックから除外される', () => {})
+
+// ❌ Bad: 何をテストしているか不明
+it('test1', () => {})
+it('should work', () => {})
+```
+
+### AAA パターン（Arrange / Act / Assert）
+
+```ts
+it('予約時間が90分の場合、終了時刻が90分後になる', () => {
+  // Arrange: 準備
+  const startAt = new Date('2026-05-03T18:00:00+09:00')
+  const durationMinutes = 90
+
+  // Act: 実行
+  const endAt = calculateEndTime(startAt, durationMinutes)
+
+  // Assert: 検証
+  expect(endAt.toISOString()).toBe('2026-05-03T10:30:00.000Z')
+})
+```
+
+---
+
+## コンポーネントテスト
+
+### 基本構造
+
+```tsx
+// components/calendar/ReservationBlock.test.tsx
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { ReservationBlock } from './ReservationBlock'
+
+describe('ReservationBlock', () => {
+  const mockReservation = {
+    id: 'r1',
+    customer_name: '田中様',
+    party_size: 4,
+    category: 'normal' as const,
+    start_at: '2026-05-03T18:00:00+09:00',
+    end_at: '2026-05-03T19:30:00+09:00',
+    table: { name: 'A-2', capacity: 4 },
+  }
+
+  it('顧客名と人数を表示する', () => {
+    render(<ReservationBlock reservation={mockReservation} onClick={() => {}} />)
+
+    expect(screen.getByText(/田中様/)).toBeInTheDocument()
+    expect(screen.getByText(/4名/)).toBeInTheDocument()
+  })
+
+  it('テーブル番号を表示する', () => {
+    render(<ReservationBlock reservation={mockReservation} onClick={() => {}} />)
+
+    expect(screen.getByText('A-2')).toBeInTheDocument()
+  })
+
+  it('クリック時に onClick が呼ばれる', async () => {
+    const handleClick = vi.fn()
+    render(<ReservationBlock reservation={mockReservation} onClick={handleClick} />)
+
+    await userEvent.click(screen.getByRole('button'))
+
+    expect(handleClick).toHaveBeenCalledWith(mockReservation)
+  })
+
+  it('VIP カテゴリの場合、紫の左ボーダーが適用される', () => {
+    const vipReservation = { ...mockReservation, category: 'vip' as const }
+    const { container } = render(
+      <ReservationBlock reservation={vipReservation} onClick={() => {}} />
+    )
+
+    const block = container.firstChild as HTMLElement
+    expect(block.className).toContain('border-l-reservation-vip')
+  })
+})
+```
+
+### Testing Library のベストプラクティス
+
+ユーザーから見える要素で取得するのが原則です。
+
+```tsx
+// ✅ Good: ユーザーが見える要素で取得
+screen.getByRole('button', { name: '予約を作成' })
+screen.getByLabelText('顧客名')
+screen.getByText('田中様')
+
+// ❌ Bad: 実装詳細に依存
+screen.getByTestId('submit-button')  // 最終手段としてのみ使用
+container.querySelector('.btn-primary')
+```
+
+---
+
+## モック
+
+### Supabase クライアントのモック
+
+```ts
+// tests/mocks/supabase.ts
+import { vi } from 'vitest'
+
+export function createMockSupabaseClient() {
+  return {
+    from: vi.fn().mockReturnThis(),
+    select: vi.fn().mockReturnThis(),
+    insert: vi.fn().mockReturnThis(),
+    update: vi.fn().mockReturnThis(),
+    delete: vi.fn().mockReturnThis(),
+    eq: vi.fn().mockReturnThis(),
+    gte: vi.fn().mockReturnThis(),
+    lte: vi.fn().mockReturnThis(),
+    single: vi.fn(),
+  }
+}
+```
+
+### モジュールのモック
+
+```ts
+import { vi } from 'vitest'
+
+vi.mock('@/lib/supabase/client', () => ({
+  createClient: () => createMockSupabaseClient(),
+}))
+```
+
+---
+
+## E2E テスト（Playwright）
+
+### 基本構造
+
+```ts
+// e2e/reservation-create.spec.ts
+import { test, expect } from '@playwright/test'
+
+test.describe('予約作成フロー', () => {
+  test.beforeEach(async ({ page }) => {
+    // ログイン
+    await page.goto('/login')
+    await page.getByLabel('メールアドレス').fill('test@example.com')
+    await page.getByLabel('パスワード').fill('password')
+    await page.getByRole('button', { name: 'ログイン' }).click()
+    await expect(page).toHaveURL('/calendar')
+  })
+
+  test('カレンダーの空きスロットをクリックして予約を作成できる', async ({ page }) => {
+    // カレンダーの18:00スロットをクリック
+    await page.locator('[data-time="18:00"][data-day="thursday"]').click()
+
+    // モーダルが表示されることを確認
+    await expect(page.getByRole('dialog', { name: '新規予約' })).toBeVisible()
+
+    // フォーム入力
+    await page.getByLabel('顧客名').fill('テスト太郎')
+    await page.getByLabel('人数').fill('4')
+    await page.getByLabel('テーブル').selectOption('A-2')
+    await page.getByRole('radio', { name: '通常' }).check()
+
+    // 送信
+    await page.getByRole('button', { name: '予約を作成' }).click()
+
+    // モーダルが閉じて予約が表示されることを確認
+    await expect(page.getByRole('dialog')).not.toBeVisible()
+    await expect(page.getByText('テスト太郎 4名')).toBeVisible()
+  })
+})
+```
+
+### data 属性での要素取得
+
+E2E テストでは安定した要素取得のため、必要に応じて `data-testid` を使ってください。
+
+```tsx
+// コンポーネント側
+<button data-testid="new-reservation-btn">＋ 新規予約</button>
+
+// テスト側
+await page.getByTestId('new-reservation-btn').click()
+```
+
+ただし、可能な限り `getByRole` `getByLabel` を優先してください（アクセシビリティの担保にもなる）。
+
+---
+
+## カバレッジ目標
+
+| 対象 | 目標カバレッジ |
+|---|---|
+| ユーティリティ関数（`lib/`） | 90%以上 |
+| ドメインロジック | 80%以上 |
+| コンポーネント | 主要パスをカバー（数値目標なし） |
+| E2E | クリティカルなユーザーフロー全網羅 |
+
+100% を目指す必要はありません。**「壊れたら困る部分」から優先的にテストを書く** 方針です。
+
+### 必ずテストを書く対象
+
+- 予約時間の重複判定ロジック
+- 営業時間チェック
+- 顧客名寄せロジック
+- 予約のステータス遷移
+- 通知送信の判定
+
+---
+
+## テスト実行
+
+```bash
+# ユニット・コンポーネントテスト（watch モード）
+npm run test
+
+# 1回だけ実行
+npm run test -- --run
+
+# カバレッジ付きで実行
+npm run test -- --coverage
+
+# E2E テスト
+npm run test:e2e
+
+# 特定ファイルのみ
+npm run test -- reservation-helpers
+```
+
+`package.json` のスクリプト例:
+
+```json
+{
+  "scripts": {
+    "test": "vitest",
+    "test:e2e": "playwright test",
+    "test:coverage": "vitest --coverage"
+  }
+}
+```
+
+---
+
+## CI でのテスト
+
+GitHub Actions での実行例:
+
+```yaml
+# .github/workflows/test.yml
+name: Test
+on: [push, pull_request]
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run test -- --run
+      - run: npm run test:coverage
+
+  e2e-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: npm run test:e2e
+```
+
+---
+
+## 禁止事項
+
+```
+❌ テストを書かないでマージ（最低限主要パスはテストする）
+❌ skip / only を残してコミット（CI で検出されるよう設定）
+❌ 実際の本番 DB に接続するテスト
+❌ 時刻に依存したテスト（vi.useFakeTimers を使う）
+❌ ランダム値で結果が変わるテスト（seed 固定 or モック）
+❌ お互いに依存するテスト（順序に依存しないこと）
+❌ 100行を超える巨大なテストケース（分割する）
+```
+
+---
+
+## 時刻を扱うテスト
+
+```ts
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+
+describe('現在時刻に依存する処理', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-03T15:30:00+09:00'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('現在時刻が15:30の場合、現在時刻ラインが正しい位置に表示される', () => {
+    const position = calculateNowLinePosition()
+    // 11:00 開始から 4.5 時間 × 60px = 270px
+    expect(position).toBe(270)
+  })
+})
+```
+
+---
+
+## まとめ：テストを書く判断基準
+
+新しいコードを書いたとき、以下に該当すればテストを書いてください。
+
+- [ ] 業務ロジックを含む（重複チェック、料金計算など）
+- [ ] バグが発生した過去がある
+- [ ] 複雑な条件分岐がある
+- [ ] 外部 API やライブラリの挙動に依存している
+- [ ] リファクタリングで壊れる可能性がある
+- [ ] ユーザーの主要な操作フロー（E2E 対象）

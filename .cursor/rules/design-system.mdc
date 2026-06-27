@@ -1,0 +1,186 @@
+---
+description: 飲食店予約管理システムのデザインシステム規約。UIコンポーネント・スタイリングを実装する際に常に参照すること。
+globs:
+  - "**/*.tsx"
+  - "**/*.jsx"
+  - "**/*.css"
+alwaysApply: true
+---
+
+# デザインシステム規約
+
+このプロジェクトのUIは Google Calendar / Linear / Vercel のようなミニマルモダンな
+スタイルを参照しています。以下の規約を厳守してください。
+
+---
+
+## カラートークン
+
+`tailwind.config.ts` に以下のカラーが定義されている前提で実装してください。
+未定義の場合は最初に追加してください。
+
+```ts
+// tailwind.config.ts
+colors: {
+  // ニュートラル
+  bg: {
+    primary: '#FFFFFF',
+    surface: '#F8F9FA',
+    hover:   '#F3F4F6',
+  },
+  border: {
+    DEFAULT: '#E5E7EB',
+  },
+  text: {
+    primary:   '#1F2937',
+    secondary: '#6B7280',
+    tertiary:  '#9CA3AF',
+  },
+  accent: {
+    DEFAULT: '#4285F4',  // 今日ハイライト・主要ボタン
+  },
+
+  // 予約カテゴリ（背景・テキスト・左ボーダー）
+  reservation: {
+    normal:   { bg: '#DBEAFE', text: '#1E40AF', border: '#3B82F6' },
+    course:   { bg: '#DCFCE7', text: '#166534', border: '#22C55E' },
+    private:  { bg: '#FEF3C7', text: '#92400E', border: '#F59E0B' },
+    waitlist: { bg: '#FEE2E2', text: '#991B1B', border: '#EF4444' },
+    vip:      { bg: '#EDE9FE', text: '#5B21B6', border: '#8B5CF6' },
+  },
+}
+```
+
+---
+
+## タイポグラフィ
+
+```
+フォント       : Inter, "Hiragino Sans", system-ui, sans-serif
+曜日・時刻      : 11px / color: text-tertiary
+予約タイトル   : 12px / font-medium
+ヘッダー月表示 : 17px / font-medium
+本文           : 14px / line-height: 1.6
+```
+
+font-weight は **400（regular）と 500（medium）の2段階のみ** 使用してください。
+600 以上は使用禁止（host UI に対して重く見えるため）。
+
+---
+
+## スペーシング・形状
+
+```
+スペーシング : 4px 基準（gap-2 / gap-3 / gap-4 / gap-6 / gap-8）
+角丸         : カレンダー枠 rounded-[10px] / 予約ブロック rounded-[5px]
+              バッジ rounded-xl / ボタン rounded-lg
+ボーダー     : デフォルト 0.5px solid border
+              カテゴリ左アクセントのみ 3px
+シャドウ     : モーダル以外は使用禁止（border で代替）
+              モーダル: shadow-[0_8px_32px_rgba(0,0,0,0.12)]
+```
+
+---
+
+## アニメーション
+
+```tsx
+// ホバー
+className="transition-opacity duration-[120ms] hover:opacity-[0.82]"
+
+// クリック
+className="active:scale-[0.97] transition-transform duration-100"
+
+// モーダル表示
+className="animate-[fadeIn_180ms_ease-out]"
+```
+
+ローディングは **必ず Skeleton UI を使用**。スピナー使用禁止。
+
+---
+
+## コンポーネント実装パターン
+
+### 予約ブロック
+
+```tsx
+// 必ずカテゴリ別のスタイルを適用
+<div
+  className={cn(
+    "rounded-[5px] border-l-[3px] px-[6px] py-[3px] cursor-pointer",
+    "transition-opacity duration-[120ms] hover:opacity-[0.82]",
+    category === 'normal' && "bg-reservation-normal-bg text-reservation-normal-text border-l-reservation-normal-border",
+    // ... 他カテゴリも同様
+  )}
+>
+  <div className="text-xs font-medium leading-tight">{customerName} {partySize}名</div>
+  <div className="text-[10px] opacity-85 mt-px">{tableName}</div>
+</div>
+```
+
+### モーダル
+
+```tsx
+// オーバーレイ
+<div className="fixed inset-0 bg-black/40 backdrop-blur-[2px] z-50">
+  {/* モーダル本体 */}
+  <div className="bg-white rounded-xl shadow-[0_8px_32px_rgba(0,0,0,0.12)] p-6">
+    ...
+  </div>
+</div>
+```
+
+### ボタン
+
+```tsx
+// プライマリボタン
+<button className="bg-accent text-white rounded-lg px-5 py-2 text-[13px]
+                   hover:bg-[#3B7DE8] transition-colors">
+  予約を作成
+</button>
+
+// セカンダリボタン
+<button className="border border-border rounded-md px-2.5 py-1 text-xs text-text-secondary
+                   hover:bg-bg-hover transition-colors">
+  今日
+</button>
+```
+
+---
+
+## 禁止事項
+
+実装時に以下を **絶対に行わない** でください。
+
+```
+❌ Bootstrap / Material UI のコンポーネントをそのまま使用
+❌ box-shadow をモーダル以外に適用
+❌ #FF0000 など原色の直接使用
+❌ 1px 超のボーダー（カテゴリ左アクセントの 3px を除く）
+❌ グラデーションの使用
+❌ スピナーでのローディング表示
+❌ アイコンのみのボタン（必ずラベルまたは aria-label を付与）
+❌ font-size 10px 未満のテキスト
+❌ font-weight 600 以上の使用
+❌ Title Case や ALL CAPS（必ず sentence case）
+```
+
+---
+
+## 参考: Tailwind 以外のスタイル
+
+複雑なグリッドレイアウト（カレンダー本体）は Tailwind では書きづらいため、
+CSS Modules または `style` 属性を併用してください。
+
+```tsx
+// 例: 週ビューのタイムライン
+<div
+  style={{
+    display: 'grid',
+    gridTemplateColumns: '52px repeat(7, 1fr)',
+  }}
+  className="border border-border rounded-[10px] overflow-hidden"
+>
+  ...
+</div>
+```

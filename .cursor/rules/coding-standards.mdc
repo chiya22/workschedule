@@ -1,0 +1,500 @@
+---
+description: TypeScript コーディング規約・命名規則・エラーハンドリングのパターン定義。コード品質を統一する。
+globs:
+  - "**/*.ts"
+  - "**/*.tsx"
+alwaysApply: true
+---
+
+# コーディング規約
+
+このプロジェクトの TypeScript コーディング規約を定義します。
+ESLint / Prettier の設定とこのドキュメントに沿ったコードを書いてください。
+
+---
+
+## TypeScript 設定
+
+`tsconfig.json` の最低要件:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+`strict: true` は必須。`any` の使用は原則禁止です。
+
+---
+
+## 命名規則
+
+### ファイル・ディレクトリ
+
+```
+コンポーネント       : PascalCase  → ReservationBlock.tsx
+hooks               : camelCase    → useReservations.ts
+ユーティリティ       : kebab-case   → format-date.ts
+型定義              : kebab-case   → reservation-types.ts
+ディレクトリ         : kebab-case   → calendar-views/
+```
+
+### 識別子
+
+```ts
+// 変数・関数: camelCase
+const reservationCount = 10
+function fetchReservations() {}
+
+// 定数: SCREAMING_SNAKE_CASE
+const MAX_PARTY_SIZE = 50
+const DEFAULT_RESERVATION_DURATION_MINUTES = 90
+
+// 型・インターフェース: PascalCase
+type Reservation = { ... }
+interface CalendarProps { ... }
+
+// React コンポーネント: PascalCase
+function WeekView() {}
+
+// Boolean: is / has / can / should プレフィックス
+const isLoading = true
+const hasError = false
+const canEdit = true
+```
+
+### 関数命名
+
+```ts
+// データ取得: fetch / get / load
+async function fetchReservations() {}
+function getReservationById(id: string) {}
+
+// データ作成・更新: create / update / save
+async function createReservation(input: ReservationInput) {}
+
+// 削除: delete / remove
+async function deleteReservation(id: string) {}
+
+// 判定: is / has / check
+function isOverlapping(a: Reservation, b: Reservation): boolean {}
+
+// 変換: format / parse / convert / to
+function formatDateForDisplay(date: Date): string {}
+function parseReservationFromForm(formData: FormData): ReservationInput {}
+```
+
+---
+
+## 型定義のルール
+
+### `interface` vs `type`
+
+オブジェクト形状の型は `type` で統一してください。
+
+```ts
+// ✅ Good: type を使用
+type Reservation = {
+  id: string
+  customerName: string
+  partySize: number
+}
+
+// ❌ 避ける: 拡張可能性が必要な場合のみ interface を使う
+interface Reservation { ... }
+```
+
+例外: クラスの実装契約として使う場合は `interface` を使用可能。
+
+### `any` 禁止
+
+```ts
+// ❌ Bad
+function handle(data: any) {}
+
+// ✅ Good: unknown を使ってナローイング
+function handle(data: unknown) {
+  if (typeof data === 'string') {
+    // ここで data は string
+  }
+}
+
+// ✅ Good: ジェネリクスで型を伝播
+function identity<T>(value: T): T {
+  return value
+}
+```
+
+### 関数の戻り値型を明示
+
+公開関数（export される関数）は戻り値の型を明示してください。
+
+```ts
+// ✅ Good
+export function calculateEndTime(start: Date, durationMinutes: number): Date {
+  return new Date(start.getTime() + durationMinutes * 60_000)
+}
+
+// ❌ Bad: 戻り値型が暗黙的
+export function calculateEndTime(start: Date, durationMinutes: number) {
+  return new Date(start.getTime() + durationMinutes * 60_000)
+}
+```
+
+---
+
+## エラーハンドリング
+
+### Result パターンを推奨
+
+例外を throw するより、Result 型で成功/失敗を表現する方が型安全です。
+
+```ts
+// types/result.ts
+export type Result<T, E = Error> =
+  | { success: true; data: T }
+  | { success: false; error: E }
+
+// 使用例
+async function createReservation(
+  input: ReservationInput
+): Promise<Result<Reservation, string>> {
+  const { data, error } = await supabase
+    .from('reservations')
+    .insert(input)
+    .select()
+    .single()
+
+  if (error) {
+    return { success: false, error: error.message }
+  }
+
+  return { success: true, data }
+}
+
+// 呼び出し側
+const result = await createReservation(input)
+if (!result.success) {
+  toast.error(result.error)
+  return
+}
+// result.data が型安全に使える
+```
+
+### try-catch は外部 API 連携でのみ使用
+
+```ts
+// ✅ Good: 外部 API では try-catch
+try {
+  const response = await fetch('https://external-api.com/...')
+  return await response.json()
+} catch (error) {
+  console.error('External API failed:', error)
+  return null
+}
+
+// ✅ Good: Supabase は error チェックで対応
+const { data, error } = await supabase.from('...').select()
+if (error) {
+  // エラーハンドリング
+}
+```
+
+---
+
+## 早期リターン
+
+ネストを深くせず、早期リターンで読みやすくしてください。
+
+```ts
+// ❌ Bad: ネストが深い
+function process(reservation: Reservation | null) {
+  if (reservation) {
+    if (reservation.status === 'confirmed') {
+      if (reservation.party_size > 0) {
+        // 処理
+      }
+    }
+  }
+}
+
+// ✅ Good: 早期リターン
+function process(reservation: Reservation | null) {
+  if (!reservation) return
+  if (reservation.status !== 'confirmed') return
+  if (reservation.party_size <= 0) return
+
+  // 処理
+}
+```
+
+---
+
+## React コンポーネントの規約
+
+### Props の型定義
+
+```tsx
+// ✅ Good: Props 型を明示
+type ReservationBlockProps = {
+  reservation: Reservation
+  onClick: (reservation: Reservation) => void
+  className?: string
+}
+
+export function ReservationBlock({
+  reservation,
+  onClick,
+  className
+}: ReservationBlockProps) {
+  // ...
+}
+```
+
+### children の型
+
+```tsx
+import type { ReactNode } from 'react'
+
+type LayoutProps = {
+  children: ReactNode  // ✅ ReactNode を使用
+}
+```
+
+### イベントハンドラ命名
+
+```tsx
+// Props 名: on + イベント名
+type Props = {
+  onSubmit: () => void
+  onClose: () => void
+}
+
+// 内部のハンドラ: handle + イベント名
+function MyForm() {
+  const handleSubmit = () => { ... }
+  const handleClose = () => { ... }
+}
+```
+
+### Hooks の命名
+
+```ts
+// use プレフィックス必須
+export function useReservationsRealtime() { ... }
+export function useCalendarView() { ... }
+```
+
+---
+
+## インポート順
+
+```ts
+// 1. React / Next.js
+import { useState, useEffect } from 'react'
+import Link from 'next/link'
+
+// 2. 外部ライブラリ
+import { z } from 'zod'
+import { format } from 'date-fns'
+
+// 3. プロジェクト内モジュール（@/ エイリアス）
+import { createClient } from '@/lib/supabase/client'
+import { formatReservationTime } from '@/lib/utils'
+
+// 4. 相対パス（同階層・子階層）
+import { ReservationBlock } from './ReservationBlock'
+
+// 5. 型のみのインポートは type キーワードで分離
+import type { Reservation } from '@/types'
+```
+
+---
+
+## バリデーション
+
+ユーザー入力のバリデーションには **Zod** を使用してください。
+
+```ts
+import { z } from 'zod'
+
+export const reservationSchema = z.object({
+  customer_name: z.string().min(1, '顧客名を入力してください').max(100),
+  party_size: z.number().int().min(1).max(50),
+  table_id: z.string().uuid(),
+  category: z.enum(['normal', 'course', 'private', 'waitlist', 'vip']),
+  start_at: z.string().datetime(),
+  end_at: z.string().datetime(),
+  notes: z.string().max(500).optional(),
+}).refine(
+  (data) => new Date(data.end_at) > new Date(data.start_at),
+  { message: '終了時刻は開始時刻より後である必要があります', path: ['end_at'] }
+)
+
+export type ReservationInput = z.infer<typeof reservationSchema>
+```
+
+### Server Action でのバリデーション
+
+```ts
+'use server'
+
+export async function createReservation(formData: FormData) {
+  const parsed = reservationSchema.safeParse({
+    customer_name: formData.get('customer_name'),
+    party_size: Number(formData.get('party_size')),
+    // ...
+  })
+
+  if (!parsed.success) {
+    return { error: parsed.error.flatten().fieldErrors }
+  }
+
+  // parsed.data を使って処理
+}
+```
+
+---
+
+## 日付・時刻の扱い
+
+### date-fns を使用
+
+```ts
+import { format, addMinutes, startOfWeek, parseISO } from 'date-fns'
+import { ja } from 'date-fns/locale'
+
+// フォーマット
+format(date, 'yyyy年M月d日（E）', { locale: ja })  // "2026年5月3日（木）"
+format(date, 'HH:mm')                              // "18:30"
+
+// 計算
+const endAt = addMinutes(startAt, 90)
+
+// パース
+const date = parseISO('2026-05-03T18:00:00+09:00')
+```
+
+### タイムゾーンに注意
+
+DB には `TIMESTAMPTZ` で保存されるため、ISO 8601 形式（タイムゾーン付き）で送信してください。
+
+```ts
+// ✅ Good
+const startAt = new Date('2026-05-03T18:00:00+09:00').toISOString()
+
+// ❌ Bad: ローカル時刻のまま送信
+const startAt = '2026-05-03 18:00:00'
+```
+
+---
+
+## 環境変数
+
+```ts
+// ✅ Good: 型安全なアクセス
+// lib/env.ts
+import { z } from 'zod'
+
+const envSchema = z.object({
+  NEXT_PUBLIC_SUPABASE_URL: z.string().url(),
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(1),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1).optional(),
+})
+
+export const env = envSchema.parse(process.env)
+```
+
+---
+
+## ロギング
+
+```ts
+// 開発時: console.log で OK
+// 本番: 構造化ログ・監視ツール（Sentry等）連携を推奨
+
+// ✅ Good: 構造化ログ
+console.log({ event: 'reservation_created', reservationId })
+
+// ❌ Bad: 文字列連結
+console.log('Created reservation ' + reservationId)
+```
+
+---
+
+## コメント
+
+### コードで自明なコメントは書かない
+
+```ts
+// ❌ Bad
+// 1 を加算する
+i += 1
+
+// ✅ Good: なぜこう書いたかをコメント
+// 営業時間外予約は警告のみで通すため、エラーをスローしない
+if (isOutsideBusinessHours(startAt)) {
+  return { warning: '営業時間外の予約です' }
+}
+```
+
+### TODO / FIXME
+
+```ts
+// TODO: 連結予約に対応する
+// FIXME: 日付跨ぎの予約で計算がずれる
+// NOTE: 貸し切り時は全テーブルをロックする仕様
+```
+
+---
+
+## 禁止事項
+
+```
+❌ any 型の使用（unknown または具体型を使う）
+❌ // @ts-ignore / // @ts-nocheck の濫用
+❌ console.log の本番コードへの残し置き
+❌ var / let の濫用（const をデフォルトに）
+❌ 三項演算子のネスト（読みづらい）
+❌ マジックナンバー（定数として定義）
+❌ 巨大な関数（50行を超えたら分割を検討）
+❌ 巨大なコンポーネント（200行を超えたら分割を検討）
+❌ 同じロジックの重複（共通化する）
+```
+
+---
+
+## ESLint / Prettier 設定例
+
+```json
+// .eslintrc.json
+{
+  "extends": [
+    "next/core-web-vitals",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "rules": {
+    "@typescript-eslint/no-explicit-any": "error",
+    "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
+    "no-console": ["warn", { "allow": ["warn", "error"] }]
+  }
+}
+```
+
+```json
+// .prettierrc
+{
+  "semi": false,
+  "singleQuote": true,
+  "trailingComma": "all",
+  "printWidth": 100,
+  "tabWidth": 2
+}
+```

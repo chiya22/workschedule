@@ -1,0 +1,330 @@
+---
+description: 飲食店予約管理システムのデータベーススキーマ定義。Supabase / PostgreSQL のテーブル構造、RLS ポリシー、マイグレーション規約を定義する。
+globs:
+  - "**/*.ts"
+  - "**/*.tsx"
+  - "supabase/**/*.sql"
+  - "types/database.ts"
+alwaysApply: true
+---
+
+# データベーススキーマ定義
+
+このプロジェクトの Supabase / PostgreSQL データベース構造を定義します。
+クエリやマイグレーションを書く際は必ずこの定義に従ってください。
+
+---
+
+## テーブル構成
+
+```
+staff          : スタッフ（auth.users と 1:1。単一現場運用のため店舗マスタなし）
+tables         : テーブル（座席）マスタ
+reservations   : 予約データ（メインテーブル）
+notifications  : 通知履歴
+```
+
+**単一店舗前提**: `stores` テーブルおよび `staff` / `tables` / `reservations` の **`store_id` 列は持たない**。スキーマ変更は `supabase/migrations/20250505120000_remove_stores_single_tenant.sql` を参照。
+
+---
+
+## staff（スタッフ）
+
+```sql
+CREATE TYPE staff_role AS ENUM ('owner', 'manager', 'staff');
+
+CREATE TABLE staff (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  role        staff_role NOT NULL DEFAULT 'staff',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE (user_id)
+);
+
+CREATE INDEX idx_staff_user_id ON staff(user_id);
+ALTER TABLE staff ENABLE ROW LEVEL SECURITY;
+```
+
+権限の使い分け:
+- `owner`: すべての操作可能（スタッフ管理含む）
+- `manager`: 予約・テーブル管理可能（スタッフ管理は不可）
+- `staff`: 予約の閲覧・作成・編集のみ
+
+---
+
+## tables（テーブル / 座席マスタ）
+
+```sql
+CREATE TABLE tables (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name        TEXT NOT NULL,           -- 'A-1', 'B-2', '個室1' など
+  capacity    INTEGER NOT NULL,        -- 最大人数
+  is_private  BOOLEAN NOT NULL DEFAULT FALSE,  -- 個室フラグ
+  display_order INTEGER NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE (name)
+);
+
+ALTER TABLE tables ENABLE ROW LEVEL SECURITY;
+```
+
+---
+
+## reservations（予約・メインテーブル）
+
+```sql
+CREATE TYPE reservation_category AS ENUM (
+  'normal',     -- 通常予約
+  'course',     -- コース予約
+  'private',    -- 貸し切り
+  'waitlist',   -- キャンセル待ち
+  'vip'         -- VIP予約
+);
+
+CREATE TYPE reservation_status AS ENUM (
+  'confirmed',  -- 確定
+  'pending',    -- 仮予約
+  'cancelled',  -- キャンセル
+  'no_show',    -- 来店なし
+  'completed'   -- 来店完了
+);
+
+CREATE TABLE reservations (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  table_id        UUID REFERENCES tables(id) ON DELETE SET NULL,
+
+  -- 予約情報
+  customer_name   TEXT NOT NULL,           -- 予約者名（マスタ管理なし）
+  customer_phone  TEXT,                    -- 連絡用の電話番号（任意）
+  party_size      INTEGER NOT NULL CHECK (party_size > 0),
+  category        reservation_category NOT NULL DEFAULT 'normal',
+  status          reservation_status NOT NULL DEFAULT 'confirmed',
+
+  -- 時刻
+  start_at        TIMESTAMPTZ NOT NULL,
+  end_at          TIMESTAMPTZ NOT NULL,
+
+  -- メモ
+  notes           TEXT,                    -- アレルギー・リクエスト等
+  internal_notes  TEXT,                    -- スタッフ間共有メモ
+
+  -- メタ情報
+  created_by      UUID REFERENCES staff(id),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CHECK (end_at > start_at)
+);
+
+CREATE INDEX idx_reservations_start_at ON reservations(start_at);
+CREATE INDEX idx_reservations_table_start ON reservations(table_id, start_at);
+CREATE INDEX idx_reservations_status ON reservations(status);
+ALTER TABLE reservations ENABLE ROW LEVEL SECURITY;
+```
+
+### 重要な制約
+
+予約時間の重複チェックは、アプリ側ではなく **PostgreSQL の EXCLUDE 制約** で
+DB レベルで担保します。
+
+```sql
+-- 同一テーブルの予約が時間的に重複しないことを保証
+ALTER TABLE reservations ADD CONSTRAINT reservations_no_time_overlap
+EXCLUDE USING gist (
+  table_id WITH =,
+  tstzrange(start_at, end_at) WITH &&
+) WHERE (status NOT IN ('cancelled', 'no_show'));
+```
+
+EXCLUDE 制約を使うため、`btree_gist` 拡張機能の有効化が必須です。
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+```
+
+---
+
+## notifications（通知履歴）
+
+```sql
+CREATE TYPE notification_channel AS ENUM ('email', 'sms', 'line');
+CREATE TYPE notification_type AS ENUM ('confirmation', 'reminder', 'cancellation');
+
+CREATE TABLE notifications (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  reservation_id  UUID NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+  channel         notification_channel NOT NULL,
+  type            notification_type NOT NULL,
+  sent_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  status          TEXT NOT NULL,           -- 'sent', 'failed', 'pending'
+  error_message   TEXT
+);
+
+CREATE INDEX idx_notifications_reservation ON notifications(reservation_id);
+ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+```
+
+---
+
+## RLS ポリシー（必須）
+
+**単一現場**: 店舗 ID ではなく、「`staff` に行があるログインユーザー（`authenticated`）」でアクセスを制御する。
+
+### reservations（例・実装はマイグレーションに準拠）
+
+```sql
+-- スタッフのみ閲覧・作成・更新
+CREATE POLICY "staff_select_reservations" ON reservations
+  FOR SELECT TO authenticated
+  USING (EXISTS (SELECT 1 FROM staff s WHERE s.user_id = auth.uid()));
+
+CREATE POLICY "staff_insert_reservations" ON reservations
+  FOR INSERT TO authenticated
+  WITH CHECK (EXISTS (SELECT 1 FROM staff s WHERE s.user_id = auth.uid()));
+
+CREATE POLICY "staff_update_reservations" ON reservations
+  FOR UPDATE TO authenticated
+  USING (EXISTS (SELECT 1 FROM staff s WHERE s.user_id = auth.uid()))
+  WITH CHECK (EXISTS (SELECT 1 FROM staff s WHERE s.user_id = auth.uid()));
+
+-- 物理削除はオーナーのみ（運用上は status = cancelled を推奨）
+CREATE POLICY "owner_delete_reservations" ON reservations
+  FOR DELETE TO authenticated
+  USING (EXISTS (SELECT 1 FROM staff s WHERE s.user_id = auth.uid() AND s.role = 'owner'));
+```
+
+`tables` / `staff` / `notifications` のポリシーも同マイグレーション（`20250505120000_remove_stores_single_tenant.sql`）を正とする。
+
+**廃止**: `user_store_ids()` / `is_store_owner(uuid)` / `stores` テーブル向けポリシー。
+
+---
+
+## TypeScript 型定義
+
+`types/database.ts` を Supabase CLI で自動生成してください。
+
+```bash
+npx supabase gen types typescript --project-id YOUR_PROJECT_ID > types/database.ts
+```
+
+### よく使う型エイリアス
+
+```ts
+// types/index.ts
+import type { Database } from './database'
+
+export type Reservation = Database['public']['Tables']['reservations']['Row']
+export type ReservationInsert = Database['public']['Tables']['reservations']['Insert']
+export type ReservationUpdate = Database['public']['Tables']['reservations']['Update']
+
+export type Table = Database['public']['Tables']['tables']['Row']
+export type Staff = Database['public']['Tables']['staff']['Row']
+
+export type ReservationCategory = Database['public']['Enums']['reservation_category']
+export type ReservationStatus = Database['public']['Enums']['reservation_status']
+
+// 結合済みの型（カレンダー表示用）
+export type ReservationWithTable = Reservation & {
+  table: Pick<Table, 'name' | 'capacity'> | null
+}
+```
+
+---
+
+## マイグレーション規約
+
+`supabase/migrations/` ディレクトリにタイムスタンプ付きで配置してください。
+
+```
+supabase/migrations/
+├── 20250504120002_create_stores.sql        … 初期履歴（以降のマイグレーションで stores は削除）
+├── …
+└── 20250505120000_remove_stores_single_tenant.sql  … 単一店舗化（stores / store_id 削除・RLS 更新）
+```
+
+新規マイグレーションはタイムスタンプ付きで追加し、**単一現場スキーマ**（`store_id` なし）に合わせる。
+
+---
+
+## クエリ実装時の注意
+
+### カレンダー表示用のクエリ
+
+カレンダー画面では reservations と tables を結合して取得することが多いです。
+**N+1 を避けるため、必ず Supabase の埋め込み select で結合してください。**
+
+```ts
+// ✅ Good: 1回のクエリで取得
+const { data } = await supabase
+  .from('reservations')
+  .select(`
+    id,
+    customer_name,
+    customer_phone,
+    party_size,
+    category,
+    start_at,
+    end_at,
+    notes,
+    table:tables (
+      id,
+      name,
+      capacity
+    )
+  `)
+  .neq('status', 'cancelled')
+  .lt('start_at', rangeEnd.toISOString())
+  .gt('end_at', rangeStart.toISOString())
+  .order('start_at')
+```
+
+### 予約重複チェック
+
+EXCLUDE 制約があるため、重複時は INSERT が自動的に失敗します。
+エラーコード `23P01` (exclusion_violation) をハンドリングしてください。
+
+```ts
+const { error } = await supabase.from('reservations').insert({ ... })
+
+if (error?.code === '23P01') {
+  return { error: 'この時間帯はすでに予約が入っています' }
+}
+```
+
+---
+
+## 禁止事項
+
+```
+❌ RLS を無効化したテーブルの作成
+❌ 直接 SQL で UPDATE/DELETE を実行（必ず Supabase クライアント経由）
+❌ アプリ側での重複チェック（EXCLUDE 制約に任せる）
+❌ enum 型を文字列リテラルで管理（型定義を使用）
+❌ select('*') で全カラム取得（必要なカラムのみ指定）
+❌ 物理削除（基本は status を 'cancelled' に変更）
+❌ updated_at の手動更新（DB トリガーで自動更新）
+❌ `stores` / `store_id` を新規に導入する（本アプリは単一現場前提）
+```
+
+---
+
+## updated_at 自動更新トリガー
+
+```sql
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 各テーブルにトリガー設定
+CREATE TRIGGER update_reservations_updated_at
+  BEFORE UPDATE ON reservations
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
+```

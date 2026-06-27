@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-inter), "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+    "Hiragino Kaku Gothic Pro", system-ui, sans-serif;
+
+  --color-bg-primary: #ffffff;
+  --color-bg-surface: #f8f9fa;
+  --color-bg-hover: #f3f4f6;
+  --color-border: #e5e7eb;
+  --color-text-primary: #1f2937;
+  --color-text-secondary: #6b7280;
+  --color-text-tertiary: #9ca3af;
+  --color-accent: #4285f4;
+
+  --color-shift-member-bg: #dbeafe;
+  --color-shift-member-text: #1e40af;
+  --color-shift-member-border: #3b82f6;
+  --color-shift-part-time-bg: #dcfce7;
+  --color-shift-part-time-text: #166534;
+  --color-shift-part-time-border: #22c55e;
+}
+
+body {
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+}
+
+a,
+:where(button:not(:disabled)),
+:where([role="button"]:not([aria-disabled="true"])) {
+  cursor: pointer;
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes modal-out {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@keyframes overlay-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes overlay-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}

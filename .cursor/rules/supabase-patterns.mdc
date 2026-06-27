@@ -1,0 +1,396 @@
+---
+description: Supabase（PostgreSQL / Auth / Realtime / Storage / Edge Functions）の利用規約。クライアント初期化、クエリ、RLS、Realtime 接続のパターンを定義する。
+globs:
+  - "**/*.ts"
+  - "**/*.tsx"
+  - "supabase/**/*"
+alwaysApply: true
+---
+
+# Supabase 利用規約
+
+このプロジェクトは Supabase をデータベース・認証・リアルタイム同期・ストレージに使用します。
+以下のパターンを厳守してください。
+
+---
+
+## クライアント初期化
+
+**Server Component / Client Component / Middleware で別々のクライアント関数を使い分ける**
+必要があります。`@supabase/ssr` パッケージを使用してください。
+
+### 必要なパッケージ
+
+```bash
+npm install @supabase/ssr @supabase/supabase-js
+```
+
+### 環境変数
+
+```bash
+# .env.local
+NEXT_PUBLIC_SUPABASE_URL=https://xxx.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJxxx...
+SUPABASE_SERVICE_ROLE_KEY=eyJxxx...   # サーバーサイドのみ（絶対にClient Componentで使わない）
+```
+
+### Server Component 用クライアント
+
+```ts
+// lib/supabase/server.ts
+import { createServerClient } from '@supabase/ssr'
+import { cookies } from 'next/headers'
+
+export function createClient() {
+  const cookieStore = cookies()
+
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll()
+        },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            )
+          } catch {
+            // Server Component から呼ばれた場合のエラーは無視
+          }
+        },
+      },
+    }
+  )
+}
+```
+
+### Client Component 用クライアント
+
+```ts
+// lib/supabase/client.ts
+import { createBrowserClient } from '@supabase/ssr'
+
+export function createClient() {
+  return createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
+}
+```
+
+### Middleware 用
+
+```ts
+// middleware.ts（プロジェクトルート）
+import { createServerClient } from '@supabase/ssr'
+import { NextResponse, type NextRequest } from 'next/server'
+
+export async function middleware(request: NextRequest) {
+  let response = NextResponse.next({ request })
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() { return request.cookies.getAll() },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
+          response = NextResponse.next({ request })
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, options)
+          )
+        },
+      },
+    }
+  )
+
+  // 認証必須ページのチェック
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user && request.nextUrl.pathname.startsWith('/calendar')) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+
+  return response
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg)$).*)'],
+}
+```
+
+---
+
+## 使い分けルール
+
+| 場所 | 使うクライアント |
+|---|---|
+| Server Component (`page.tsx`, `layout.tsx`) | `lib/supabase/server.ts` |
+| Client Component (`'use client'`) | `lib/supabase/client.ts` |
+| Server Action (`'use server'`) | `lib/supabase/server.ts` |
+| Route Handler (`route.ts`) | `lib/supabase/server.ts` |
+| Middleware | `middleware.ts` 内で個別実装 |
+
+---
+
+## クエリパターン
+
+### 基本的な SELECT
+
+```ts
+// Server Component
+const supabase = createClient()
+const { data, error } = await supabase
+  .from('reservations')
+  .select('*, table:tables(name, capacity)')
+  .gte('start_at', startOfWeek.toISOString())
+  .lte('end_at', endOfWeek.toISOString())
+  .order('start_at', { ascending: true })
+
+if (error) {
+  console.error('Failed to fetch reservations:', error)
+  // エラーハンドリング
+}
+```
+
+### INSERT（Server Action）
+
+```ts
+'use server'
+
+import { createClient } from '@/lib/supabase/server'
+import { revalidatePath } from 'next/cache'
+
+export async function createReservation(formData: FormData) {
+  const supabase = createClient()
+
+  const { error } = await supabase.from('reservations').insert({
+    customer_name: formData.get('customer_name') as string,
+    party_size: Number(formData.get('party_size')),
+    table_id: formData.get('table_id') as string,
+    category: formData.get('category') as string,
+    start_at: formData.get('start_at') as string,
+    end_at: formData.get('end_at') as string,
+    notes: formData.get('notes') as string,
+  })
+
+  if (error) {
+    return { error: error.message }
+  }
+
+  revalidatePath('/calendar')
+  return { success: true }
+}
+```
+
+### UPDATE / DELETE
+
+```ts
+// 更新
+const { error } = await supabase
+  .from('reservations')
+  .update({ category: 'confirmed' })
+  .eq('id', reservationId)
+
+// 削除
+const { error } = await supabase
+  .from('reservations')
+  .delete()
+  .eq('id', reservationId)
+```
+
+---
+
+## 型安全性（TypeScript）
+
+### 型定義の自動生成
+
+Supabase CLI で型を自動生成してください。
+
+```bash
+npx supabase gen types typescript --project-id YOUR_PROJECT_ID > types/database.ts
+```
+
+### 型付きクライアント
+
+```ts
+// lib/supabase/server.ts
+import type { Database } from '@/types/database'
+
+export function createClient() {
+  return createServerClient<Database>(...)
+}
+```
+
+これで `supabase.from('reservations').select()` の戻り値が型推論されます。
+
+---
+
+## RLS（Row Level Security）の前提
+
+**全テーブルで RLS を有効にする** のがこのプロジェクトの方針です。
+クエリ時にユーザーが **許可されたデータだけ** 見え・書き込めることを DB レベルで担保します。
+**単一現場**: `store_id` はなく、`staff` に行がある `authenticated` ユーザーが予約・座席を扱う（詳細は `database-schema.mdc`）。
+
+### RLS ポリシー例（reservations テーブル・単一現場）
+
+```sql
+CREATE POLICY "staff_select_reservations" ON reservations
+  FOR SELECT TO authenticated
+  USING (EXISTS (SELECT 1 FROM staff s WHERE s.user_id = auth.uid()));
+
+CREATE POLICY "staff_insert_reservations" ON reservations
+  FOR INSERT TO authenticated
+  WITH CHECK (EXISTS (SELECT 1 FROM staff s WHERE s.user_id = auth.uid()));
+```
+
+### クエリ側での注意
+
+RLS が効くため、**店舗 ID での `.eq('store_id', …)` は不要**（列も存在しない）。
+日付レンジや `status` など、画面の要件に応じた条件のみ付与する。
+
+```ts
+const { data } = await supabase
+  .from('reservations')
+  .select('id, start_at, end_at, table:tables(name)')
+  .neq('status', 'cancelled')
+  .lt('start_at', rangeEnd.toISOString())
+  .gt('end_at', rangeStart.toISOString())
+```
+
+---
+
+## Realtime 同期
+
+予約の変更を全スタッフ画面にリアルタイム反映するために Realtime を使用します。
+
+```tsx
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+
+export function CalendarView({ initialReservations }) {
+  const [reservations, setReservations] = useState(initialReservations)
+
+  useEffect(() => {
+    const supabase = createClient()
+
+    const channel = supabase
+      .channel('reservations')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'reservations' },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            setReservations(prev => [...prev, payload.new])
+          } else if (payload.eventType === 'UPDATE') {
+            setReservations(prev =>
+              prev.map(r => r.id === payload.new.id ? payload.new : r)
+            )
+          } else if (payload.eventType === 'DELETE') {
+            setReservations(prev => prev.filter(r => r.id !== payload.old.id))
+          }
+        }
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(channel)
+    }
+  }, [])
+
+  return <Calendar reservations={reservations} />
+}
+```
+
+---
+
+## 認証
+
+### ログイン
+
+```tsx
+'use client'
+
+const supabase = createClient()
+const { error } = await supabase.auth.signInWithPassword({
+  email,
+  password,
+})
+```
+
+### OAuth（Google など）
+
+```tsx
+const { error } = await supabase.auth.signInWithOAuth({
+  provider: 'google',
+  options: {
+    redirectTo: `${window.location.origin}/auth/callback`,
+  },
+})
+```
+
+### ログアウト
+
+```tsx
+const supabase = createClient()
+await supabase.auth.signOut()
+router.push('/login')
+```
+
+### 現在のユーザー取得
+
+```tsx
+// Server Component
+const supabase = createClient()
+const { data: { user } } = await supabase.auth.getUser()
+
+if (!user) {
+  redirect('/login')
+}
+```
+
+---
+
+## エラーハンドリング
+
+Supabase のエラーは `error` オブジェクトに格納されます。throw されません。
+
+```ts
+const { data, error } = await supabase.from('reservations').select('*')
+
+if (error) {
+  // ✅ Good: 必ず error をチェック
+  console.error('Supabase error:', error.message)
+  return { error: '予約の取得に失敗しました' }
+}
+
+// data を使った処理
+```
+
+---
+
+## 禁止事項
+
+```
+❌ Service Role Key を Client Component で使用
+❌ RLS を無効化したテーブルの作成
+❌ Server Component で createBrowserClient を使用
+❌ Client Component で createServerClient を使用
+❌ error チェックを省略してデータを使う
+❌ select('*') の濫用（必要なカラムのみ指定する）
+❌ N+1 クエリ（join やネスト select で1回にまとめる）
+❌ 型生成なしでの開発（必ず types/database.ts を生成）
+```
+
+---
+
+## 参考リンク
+
+- [Supabase + Next.js 公式ガイド](https://supabase.com/docs/guides/auth/server-side/nextjs)
+- [@supabase/ssr](https://www.npmjs.com/package/@supabase/ssr)
+- [Realtime](https://supabase.com/docs/guides/realtime)

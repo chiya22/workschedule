@@ -1,0 +1,261 @@
+---
+description: Next.js App Router を使った実装の規約。Server / Client Components の使い分け、ファイル配置、データ取得パターンを定義する。
+globs:
+  - "app/**/*.tsx"
+  - "app/**/*.ts"
+  - "components/**/*.tsx"
+alwaysApply: true
+---
+
+# Next.js App Router 実装規約
+
+このプロジェクトは Next.js 14+ の App Router を使用しています。
+**Pages Router（pages/ ディレクトリ）の書き方は使用禁止**。
+
+---
+
+## ディレクトリ構成
+
+```
+app/
+├── (auth)/                   # 認証関連ページ（ルートグループ）
+│   ├── login/
+│   └── signup/
+├── (dashboard)/              # 認証必須エリア
+│   ├── calendar/
+│   │   ├── page.tsx          # /calendar
+│   │   ├── day/page.tsx      # /calendar/day
+│   │   ├── week/page.tsx     # /calendar/week
+│   │   └── month/page.tsx    # /calendar/month
+│   ├── reservations/
+│   └── settings/
+├── api/                      # Route Handlers
+│   └── reservations/
+│       └── route.ts
+├── layout.tsx                # ルートレイアウト
+└── page.tsx                  # ランディングページ
+
+components/
+├── calendar/                 # カレンダー関連コンポーネント
+│   ├── WeekView.tsx
+│   ├── DayView.tsx
+│   ├── MonthView.tsx
+│   └── ReservationBlock.tsx
+├── modals/
+│   ├── NewReservationModal.tsx
+│   └── ReservationDetailModal.tsx
+└── ui/                       # 汎用UI部品
+
+lib/
+├── supabase/
+│   ├── server.ts             # Server Component 用クライアント
+│   ├── client.ts             # Client Component 用クライアント
+│   └── middleware.ts         # ミドルウェア用
+└── utils.ts
+
+types/
+└── database.ts               # Supabase の型定義
+```
+
+---
+
+## Server Components と Client Components の使い分け
+
+### デフォルトは Server Component
+
+ファイル冒頭に `'use client'` を **書かない** のがデフォルトです。
+以下に該当する場合のみ Client Component にしてください。
+
+```tsx
+'use client'  // 以下に該当する場合のみ記述
+
+// 1. useState / useEffect などの React Hooks を使う
+// 2. onClick / onChange などのイベントハンドラを使う
+// 3. ブラウザ専用 API（window, document）を使う
+// 4. サードパーティの Client-only ライブラリを使う
+```
+
+### 使い分けの判断基準
+
+| ケース | コンポーネント種別 |
+|---|---|
+| カレンダー表示（データ表示のみ） | Server Component |
+| 予約ブロック（クリックでモーダル開く） | Client Component |
+| 新規予約モーダル（フォーム入力あり） | Client Component |
+| ヘッダーナビ（リンク遷移のみ） | Server Component |
+| ビュー切り替えタブ（クリックで状態変更） | Client Component |
+
+### コロケーションパターン
+
+ページ全体は Server Component にして、インタラクティブな部分だけ
+Client Component に切り出すのが推奨パターンです。
+
+```tsx
+// app/(dashboard)/calendar/page.tsx (Server Component)
+import { createServerClient } from '@/lib/supabase/server'
+import { CalendarView } from '@/components/calendar/CalendarView'  // Client Component
+
+export default async function CalendarPage() {
+  const supabase = createServerClient()
+  const { data: reservations } = await supabase
+    .from('reservations')
+    .select('*')
+    .gte('start_at', startOfWeek)
+    .lte('end_at', endOfWeek)
+
+  return <CalendarView initialReservations={reservations ?? []} />
+}
+```
+
+```tsx
+// components/calendar/CalendarView.tsx
+'use client'
+
+import { useState } from 'react'
+
+export function CalendarView({ initialReservations }) {
+  const [view, setView] = useState<'day' | 'week' | 'month'>('week')
+  // ...
+}
+```
+
+---
+
+## データ取得パターン
+
+### Server Component での取得（推奨）
+
+初期表示のデータは Server Component で取得し、Props で Client Component に渡してください。
+
+```tsx
+// ✅ Good
+export default async function Page() {
+  const data = await fetchReservations()
+  return <ReservationList data={data} />
+}
+
+// ❌ Bad: Client Component で初期データを fetch
+'use client'
+export default function Page() {
+  const [data, setData] = useState([])
+  useEffect(() => { fetchReservations().then(setData) }, [])
+  return <ReservationList data={data} />
+}
+```
+
+### Client Component での更新
+
+予約の作成・更新・削除など、ユーザー操作後のデータ更新は
+Server Actions または Route Handlers を使ってください。
+
+```tsx
+// Server Action（推奨・シンプルな更新向け）
+'use server'
+
+export async function createReservation(formData: FormData) {
+  const supabase = createServerClient()
+  await supabase.from('reservations').insert({ ... })
+  revalidatePath('/calendar')
+}
+```
+
+```tsx
+// Route Handler（複雑なロジック・外部 API 連携向け）
+// app/api/reservations/route.ts
+export async function POST(req: Request) {
+  const body = await req.json()
+  // バリデーション・通知送信など複雑な処理
+  return Response.json({ ok: true })
+}
+```
+
+---
+
+## ルーティングと Navigation
+
+### Link の使い方
+
+```tsx
+// ✅ Good: next/link を使用
+import Link from 'next/link'
+<Link href="/calendar/day">日表示</Link>
+
+// ❌ Bad: <a> タグで同一サイト内遷移
+<a href="/calendar/day">日表示</a>
+```
+
+### プログラマティック Navigation
+
+```tsx
+'use client'
+import { useRouter } from 'next/navigation'  // ⚠️ next/router ではない
+
+const router = useRouter()
+router.push('/calendar/day')
+```
+
+---
+
+## メタデータ
+
+各ページに必ず metadata を設定してください。
+
+```tsx
+// app/(dashboard)/calendar/page.tsx
+import type { Metadata } from 'next'
+
+export const metadata: Metadata = {
+  title: '予約カレンダー | 予約管理システム',
+  description: '飲食店の予約をカレンダー形式で管理',
+}
+```
+
+---
+
+## パフォーマンス
+
+### Suspense で段階的に表示
+
+データ取得が遅い部分は Suspense で囲んで Skeleton UI を表示してください。
+
+```tsx
+import { Suspense } from 'react'
+import { CalendarSkeleton } from '@/components/ui/CalendarSkeleton'
+
+export default function Page() {
+  return (
+    <Suspense fallback={<CalendarSkeleton />}>
+      <CalendarView />
+    </Suspense>
+  )
+}
+```
+
+### 画像は next/image
+
+```tsx
+import Image from 'next/image'
+
+<Image src="/logo.png" alt="ロゴ" width={120} height={40} />
+```
+
+---
+
+## 禁止事項
+
+```
+❌ pages/ ディレクトリの使用（App Router のみ使用）
+❌ getServerSideProps / getStaticProps（App Router では不要）
+❌ 'use client' をすべてのファイルに記述
+❌ Server Component で onClick などのイベントハンドラを設定
+❌ Client Component で async/await のトップレベル使用
+❌ next/router からの useRouter import（next/navigation を使用）
+❌ Server Component から直接 fetch せず Client Component で fetch
+```
+
+---
+
+## 参考リンク
+
+- [App Router 公式ドキュメント](https://nextjs.org/docs/app)
+- [Server Components vs Client Components](https://nextjs.org/docs/app/building-your-application/rendering/composition-patterns)

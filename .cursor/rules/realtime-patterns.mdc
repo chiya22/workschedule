@@ -1,0 +1,381 @@
+---
+description: Supabase Realtime を使った双方向同期の実装規約。チャンネル管理、楽観的更新、競合解決のパターンを定義する。
+globs:
+  - "components/**/*.tsx"
+  - "hooks/**/*.ts"
+alwaysApply: false
+---
+
+# Realtime 同期の実装規約
+
+複数スタッフが同時にカレンダーを操作するため、Supabase Realtime で
+データの変更を即座に全クライアントに反映する仕組みを実装します。
+
+このルールは Realtime を扱うコンポーネント・hooks に適用してください。
+
+---
+
+## いつ Realtime を使うか
+
+```
+✅ カレンダー画面の予約データ
+✅ 複数人が同時に編集する可能性があるデータ
+✅ ステータス変更を即座に共有したいデータ
+
+❌ 設定画面など個人専用のデータ
+❌ 集計・統計データ（高頻度更新の必要なし）
+❌ マスタデータ（座席 `tables` など滅多に変更されない）
+```
+
+---
+
+## チャンネル命名規則
+
+**単一現場**: 店舗 ID でチャンネルを分けない。テーブル単位で固定名を使う。
+
+```
+reservations          … 予約の postgres_changes（RLS で配信が制限される）
+notifications:…      … 将来、ユーザー単位で分ける場合のみスコープを付与
+```
+
+マルチテナント化する場合は、その時点で `store_id` 相当のフィルタとチャンネル分割を設計し直す。
+
+---
+
+## 基本実装パターン
+
+### useReservationsRealtime カスタムフック
+
+頻用するため、フック化してください。
+
+```ts
+// hooks/useReservationsRealtime.ts
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import type { ReservationWithTable } from '@/types'
+
+type Options = {
+  initialData: ReservationWithTable[]
+}
+
+export function useReservationsRealtime({ initialData }: Options) {
+  const [reservations, setReservations] = useState<ReservationWithTable[]>(initialData)
+
+  useEffect(() => {
+    const supabase = createClient()
+    const channel = supabase
+      .channel('reservations')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'reservations',
+        },
+        async (payload) => {
+          const { data } = await supabase
+            .from('reservations')
+            .select('*, table:tables(id, name, capacity)')
+            .eq('id', (payload.new as { id: string }).id)
+            .single()
+
+          if (data) {
+            setReservations(prev => {
+              if (prev.some(r => r.id === data.id)) return prev
+              return [...prev, data as ReservationWithTable]
+            })
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'reservations',
+        },
+        async (payload) => {
+          const updated = payload.new as ReservationWithTable
+          if (updated.status === 'cancelled') {
+            setReservations(prev => prev.filter(r => r.id !== updated.id))
+            return
+          }
+          const { data } = await supabase
+            .from('reservations')
+            .select('*, table:tables(id, name, capacity)')
+            .eq('id', updated.id)
+            .single()
+          if (data) {
+            setReservations(prev =>
+              prev.map(r => (r.id === data.id ? (data as ReservationWithTable) : r)),
+            )
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'DELETE',
+          schema: 'public',
+          table: 'reservations',
+        },
+        (payload) => {
+          setReservations(prev =>
+            prev.filter(r => r.id !== (payload.old as { id: string }).id)
+          )
+        }
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(channel)
+    }
+  }, [])
+
+  return { reservations, setReservations }
+}
+```
+
+### コンポーネントでの利用
+
+```tsx
+'use client'
+
+import { useReservationsRealtime } from '@/hooks/useReservationsRealtime'
+
+export function CalendarView({
+  initialReservations,
+}: {
+  initialReservations: ReservationWithTable[]
+}) {
+  const { reservations } = useReservationsRealtime({
+    initialData: initialReservations,
+  })
+
+  // ... reservations を使ってカレンダーを表示
+}
+```
+
+---
+
+## 楽観的更新（Optimistic Update）
+
+ユーザー操作のレスポンスを即座に反映するため、サーバー応答を待たずに
+UI を先に更新するパターンです。
+
+```tsx
+'use client'
+
+import { useOptimistic, startTransition } from 'react'
+import { createReservation } from '@/lib/data/reservation-actions'
+
+export function NewReservationModal({ onClose }: { onClose: () => void }) {
+  const [optimisticReservations, addOptimistic] = useOptimistic(
+    reservations,
+    (current, newReservation) => [...current, newReservation]
+  )
+
+  async function handleSubmit(formData: FormData) {
+    const tempReservation = {
+      id: `temp-${crypto.randomUUID()}`,
+      // ... フォームデータから生成
+    }
+
+    startTransition(() => {
+      addOptimistic(tempReservation)
+    })
+
+    const result = await createReservation({ ... })
+
+    if (!result.success) {
+      // 失敗時は楽観的更新が自動で巻き戻る
+      toast.error(result.error)
+      return
+    }
+
+    onClose()
+  }
+}
+```
+
+注意: Realtime と楽観的更新を組み合わせる場合、サーバーから返ってくる
+INSERT イベントと一時データが重複しないよう、ID で照合してください。
+
+---
+
+## 競合解決
+
+### 同時編集の検出
+
+複数スタッフが同じ予約を同時に編集した場合に対応するパターンです。
+
+```ts
+// updated_at をチェックして競合検出
+export async function updateReservation(
+  id: string,
+  input: ReservationUpdate,
+  expectedUpdatedAt: string
+): Promise<Result<Reservation, string>> {
+  const supabase = createClient()
+
+  const { data: current } = await supabase
+    .from('reservations')
+    .select('updated_at')
+    .eq('id', id)
+    .single()
+
+  if (current && current.updated_at !== expectedUpdatedAt) {
+    return {
+      success: false,
+      error: 'この予約は他のスタッフによって更新されました。再読み込みしてください。',
+    }
+  }
+
+  // 更新処理
+  const { data, error } = await supabase
+    .from('reservations')
+    .update(input)
+    .eq('id', id)
+    .select()
+    .single()
+
+  // ...
+}
+```
+
+### 楽観的ロックの代替: Last-Write-Wins
+
+シンプルな運用では「最後の書き込みが勝つ」方針でも構いません。
+飲食店の予約管理では、同時編集が起きてもデータ破損のリスクは低いため、
+初期実装では Last-Write-Wins で問題ありません。
+
+---
+
+## チャンネルの管理
+
+### 1ページ1チャンネルの原則
+
+複数のチャンネルを乱立させず、ページ単位で1つのチャンネルにまとめてください。
+
+```ts
+// ✅ Good: 1つのチャンネルで複数のテーブルを購読
+const channel = supabase
+  .channel('calendar')
+  .on('postgres_changes', { table: 'reservations', ... }, ...)
+  .on('postgres_changes', { table: 'tables', ... }, ...)
+  .subscribe()
+
+// ❌ Bad: テーブルごとにチャンネルを分ける
+const channel1 = supabase.channel('reservations').on(...).subscribe()
+const channel2 = supabase.channel('tables').on(...).subscribe()
+```
+
+### クリーンアップは必須
+
+`useEffect` のクリーンアップで必ずチャンネルを削除してください。
+削除しないとメモリリークと意図しない更新の原因になります。
+
+```tsx
+useEffect(() => {
+  const channel = supabase.channel(...).subscribe()
+
+  return () => {
+    supabase.removeChannel(channel)  // ← 必須
+  }
+}, [])
+```
+
+---
+
+## Realtime の有効化（Supabase 設定）
+
+各テーブルで Realtime を使うには、Supabase ダッシュボードで以下を設定する必要があります。
+
+```
+Database > Replication > supabase_realtime publication に対象テーブルを追加
+```
+
+または SQL で:
+
+```sql
+ALTER PUBLICATION supabase_realtime ADD TABLE reservations;
+ALTER PUBLICATION supabase_realtime ADD TABLE tables;
+```
+
+---
+
+## RLS と Realtime の関係
+
+**Realtime も RLS の影響を受けます。**
+
+ユーザーが SELECT 権限を持たない行の変更通知は受け取れません。
+**単一現場**では `store_id` フィルタは使わず、RLS が「スタッフに見える予約」のみ Realtime 配信の対象にする。
+
+**RLS を設定しないと**意図しない行の変更が配信される可能性があるため、`database-schema.mdc` のポリシーを先に整えてから Realtime を実装してください。
+
+---
+
+## デバッグ
+
+### Realtime が動作しない時のチェックリスト
+
+```
+1. Supabase ダッシュボードで replication が有効化されているか
+2. テーブルの RLS ポリシーが SELECT を許可しているか
+3. チャンネル名にタイポがないか
+4. マルチテナント時のみ: `filter` 句の形式が正しいか（単一現場では省略し RLS に任せる）
+5. .subscribe() を呼び忘れていないか
+6. ブラウザコンソールに WebSocket エラーが出ていないか
+```
+
+### ログ出力
+
+開発時はチャンネルのステータスをログに出力すると便利です。
+
+```ts
+const channel = supabase
+  .channel('reservations')
+  .on('postgres_changes', { ... }, (payload) => {
+    console.log('[Realtime]', payload.eventType, payload)
+    // ...
+  })
+  .subscribe((status, err) => {
+    console.log('[Realtime] Channel status:', status)
+    if (err) console.error('[Realtime] Error:', err)
+  })
+```
+
+---
+
+## パフォーマンス上の注意
+
+### Realtime の filter と RLS
+
+**本アプリ（単一現場）**: `postgres_changes` に **`filter` を付けない**。チャンネル購読後に届くイベントは **RLS で閲覧可能な行に限定**される。
+
+マルチテナントで `store_id` 等を DB に持つ場合は、`filter: 'store_id=eq.<uuid>'` で受信量を抑えるパターンも検討する。
+
+```ts
+// 単一現場: filter なし + RLS
+.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'reservations' }, handler)
+```
+
+### 高頻度更新には注意
+
+Realtime は秒間数百〜数千件の更新には向きません。
+大量更新が発生する場合は、debounce や定期 polling との組み合わせを検討してください。
+
+---
+
+## 禁止事項
+
+```
+❌ チャンネルのクリーンアップを省略する
+❌ マルチテナントで filter も RLS も無い状態で購読する
+❌ 1ページで複数チャンネルを乱立させる
+❌ Realtime のペイロードを直接信用する（必要に応じて再フェッチ）
+❌ RLS なしのテーブルで Realtime を有効化する
+❌ サーバーサイドで Realtime を使う（クライアント専用機能）
+```
